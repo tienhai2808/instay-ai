@@ -1,0 +1,29 @@
+__pycache__/
+.env*
+!.env.example
+logs/
+catboost_info/
+.pytest_cache/
+docker-compose*
+
+# Python environments and tooling caches
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.ipynb_checkpoints/
+*.py[cod]
+
+# Coverage and packaging output
+.coverage*
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor metadata
+.idea/
+.vscode/
+.DS_Store

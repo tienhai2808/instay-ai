@@ -1,0 +1,47 @@
+# Version control and editor metadata
+.git
+.github
+.gitignore
+.idea
+.vscode
+.DS_Store
+
+# Real env files and credentials are supplied at runtime.
+.env*
+*.pem
+*.key
+credentials.json
+
+# Local Python environments and caches
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.pyright
+.ipynb_checkpoints
+**/.ipynb_checkpoints
+
+# Test/build output and runtime files
+.coverage*
+coverage.xml
+htmlcov
+dist
+build
+*.egg-info
+logs
+catboost_info
+
+# Training/research inputs are not used by the inference image.
+data
+ml
+notebooks
+tests
+scripts
+docker-compose*
+
+# Keep app/, proto/ (including generated Python), models/, pyproject.toml and
+# poetry.lock in the build context: the Dockerfile requires these files.

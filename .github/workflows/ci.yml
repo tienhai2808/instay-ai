@@ -1,0 +1,310 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+  POETRY_VERSION: "2.3.4"
+  COVERAGE_THRESHOLD: "40"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+  packages: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  pre-checks:
+    name: Pre checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Secrets scan
+        run: |
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.0/gitleaks_8.30.0_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks detect --source . --redact --exit-code 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${{ env.POETRY_VERSION }}" ruff
+
+      - name: Poetry lock consistency
+        run: poetry check --lock
+
+      - name: Ruff lint
+        run: ruff check app
+
+      - name: Ruff format check
+        run: ruff format --check app
+
+      - name: Python compile check
+        run: python -m compileall -q app proto
+
+  sast:
+    name: SAST
+    runs-on: ubuntu-24.04
+    needs: pre-checks
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install SAST tools
+        run: |
+          python -m pip install --upgrade pip
+          # semgrep/semdep may still import tomli on Python 3.12 in some builds.
+          python -m pip install --upgrade bandit semgrep tomli
+
+      - name: Bandit
+        run: bandit -r app -ll -iii
+
+      - name: Semgrep
+        run: |
+          python -c "import tomli; print('tomli import OK')"
+          SEMGREP_BIN="$(python -c 'import os,sys; print(os.path.join(os.path.dirname(sys.executable), "semgrep"))')"
+          "$SEMGREP_BIN" scan \
+            --config p/python \
+            --config p/owasp-top-ten \
+            --sarif --output semgrep.sarif .
+
+      # - name: Upload SAST reports
+      #   if: always() && hashFiles('semgrep.sarif') != ''
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: sast-reports
+      #     path: semgrep.sarif
+
+  sca:
+    name: SCA
+    runs-on: ubuntu-24.04
+    needs: pre-checks
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install SCA tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${{ env.POETRY_VERSION }}" poetry-plugin-export pip-audit
+
+      - name: Export runtime dependencies from lockfile
+        run: |
+          poetry export --only main --without-hashes -f requirements.txt -o requirements-main.txt
+
+      - name: Normalize requirements for pip-audit
+        run: |
+          cp requirements-main.txt requirements-main-audit.txt
+          # pip-audit only audits dependencies that can be resolved from PyPI.
+          # Our runtime torch comes from the PyTorch CPU index and uses a local tag (+cpu),
+          # so it must be excluded from pip-audit input to keep strict mode for the rest.
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("requirements-main-audit.txt")
+          out_lines = []
+          for raw_line in path.read_text().splitlines():
+              line = raw_line
+              stripped = line.strip()
+              lower = stripped.lower()
+              if lower.startswith("torch==") or lower.startswith("torch @") or lower.startswith("torch==="):
+                  continue
+              out_lines.append(line)
+          path.write_text("\n".join(out_lines) + "\n")
+          PY
+          echo "Torch requirement after normalization (must be empty):"
+          grep -Ei '^torch([[:space:]]*([=@]{1,2})|$)' requirements-main-audit.txt || true
+
+      - name: pip-audit
+        run: |
+          # Temporary exception:
+          # transformers 4.57.x is flagged by CVE-2026-1839 and the suggested fix is
+          # currently a pre-release (5.0.0rc3). Keep strict mode for everything else.
+          pip-audit -r requirements-main-audit.txt --strict --ignore-vuln CVE-2026-1839
+
+  build-test:
+    name: Build & Test
+    runs-on: ubuntu-24.04
+    needs: [sast, sca]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "poetry==${{ env.POETRY_VERSION }}"
+          poetry config virtualenvs.create true
+          poetry install --with dev --no-root --sync --no-interaction --no-ansi
+          poetry run python -m pip install pytest pytest-cov
+
+      - name: Ensure tests exist
+        run: |
+          if ! find . -type f \( -path "./tests/*.py" -o -path "./tests/**/*.py" -o -name "test_*.py" -o -name "*_test.py" \) | grep -q .; then
+            echo "No tests found. Add tests before merging."
+            exit 1
+          fi
+
+      - name: Unit tests + coverage
+        run: |
+          poetry run pytest -q \
+            --maxfail=1 \
+            --disable-warnings \
+            --cov=app \
+            --cov=proto \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=${{ env.COVERAGE_THRESHOLD }}
+
+  container-scan:
+    name: Container scan
+    runs-on: ubuntu-24.04
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Ensure docker build context directories exist
+        run: |
+          mkdir -p logs
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ github.sha }} .
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: Trivy — SBOM scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: sbom
+          scan-ref: sbom.spdx.json
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Export Docker image for downstream jobs
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-image"
+          docker save "$IMAGE_NAME:$GITHUB_SHA" | gzip -1 > "$RUNNER_TEMP/docker-image/image.tar.gz"
+
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: ${{ runner.temp }}/docker-image/image.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  publish:
+    name: Publish image to GHCR
+    runs-on: ubuntu-24.04
+    needs: container-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: ${{ runner.temp }}/docker-image
+
+      - name: Load Docker image
+        run: docker load --input "$RUNNER_TEMP/docker-image/image.tar.gz"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image to GHCR
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.0.0
+
+      - name: Sign image (keyless via Sigstore)
+        run: cosign sign --yes ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: .
+
+      - name: Attach SBOM to image
+        run: |
+          cosign attach sbom \
+            --sbom sbom.spdx.json \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/docker-image"
+          rm -f sbom.spdx.json
