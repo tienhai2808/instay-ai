@@ -3,7 +3,7 @@ name = "instay-ai"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "Hai Cao",email = "tienhai@frontierxsolutions.vn"}
+    {name = "Tien Hai",email = "tienhai2808@gmail.com"}
 ]
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
