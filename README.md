@@ -139,6 +139,8 @@ Pushes to `main`, pull requests targeting `main` and manual runs execute the che
 2. `sast` and `sca` run in parallel: Bandit + Semgrep, and pip-audit from the lockfile export.
 3. `build-test`: pytest with the existing `40%` coverage threshold.
 4. `container-scan`: Docker build → SPDX SBOM generation → Trivy SBOM scan, matching frontend/backend ordering.
-5. `publish`: push `ghcr.io/<owner>/<repo>:<commit-sha>`, sign the image and attach the SBOM.
+5. `publish`: push `tienhai2808/instay-ai:<commit-sha>` to Docker Hub, sign the image and attach the SBOM.
+
+Set the repository Actions secret `DOCKERHUB_TOKEN` to a Docker Hub access token with write access for `tienhai2808`.
 
 Image and SBOM are passed between jobs as workflow artifacts. Only the commit SHA image tag is published; deployment selects the desired SHA. `make github CM="message"` requires the current branch to be `main` and pushes it via `git push origin main`.
