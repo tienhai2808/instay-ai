@@ -1,5 +1,6 @@
-import grpc
 import threading
+
+import grpc
 
 from app.absa_inference import ABSAInferenceEngine
 from app.booking_inference import BookingInferenceEngine

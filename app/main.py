@@ -4,6 +4,7 @@ import time
 from types import FrameType
 
 from app.grpc_server import GrpcServer
+
 from .logger import get_logger
 
 logger = get_logger("main")

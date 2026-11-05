@@ -1,4 +1,5 @@
 from concurrent import futures
+
 import grpc
 
 from app.config import config

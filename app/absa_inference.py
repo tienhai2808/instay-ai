@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import re
 import shutil
-import threading
 import tempfile
+import threading
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -291,10 +291,10 @@ class ABSAInferenceEngine:
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "Failed to load model `%s` (revision=%s): %s",
+                    "Failed to load model `%s` (revision=%s)",
                     model_repo,
                     model_revision,
-                    exc,
+                    exc_info=True,
                 )
 
         raise RuntimeError(
@@ -316,10 +316,10 @@ class ABSAInferenceEngine:
             except Exception as exc:
                 last_error = exc
                 logger.warning(
-                    "Failed to load tokenizer from `%s` (revision=%s): %s",
+                    "Failed to load tokenizer from `%s` (revision=%s)",
                     candidate,
                     revision,
-                    exc,
+                    exc_info=True,
                 )
 
         raise RuntimeError(
@@ -355,12 +355,12 @@ class ABSAInferenceEngine:
                     f"{code_repo}@{code_repo_revision}"
                 )
                 return str(runtime_dir), display_name
-            except Exception as exc:
+            except Exception:
                 logger.warning(
-                    "Cannot reuse models.py from `%s` (revision=%s): %s",
+                    "Cannot reuse models.py from `%s` (revision=%s)",
                     code_repo,
                     code_repo_revision,
-                    exc,
+                    exc_info=True,
                 )
 
         raise RuntimeError(
@@ -479,9 +479,12 @@ class ABSAInferenceEngine:
         logits = getattr(outputs, "logits", None)
         if isinstance(logits, torch.Tensor):
             return logits
-        if isinstance(outputs, (list, tuple)) and outputs:
-            if isinstance(outputs[0], torch.Tensor):
-                return outputs[0]
+        if (
+            isinstance(outputs, (list, tuple))
+            and outputs
+            and isinstance(outputs[0], torch.Tensor)
+        ):
+            return outputs[0]
         raise RuntimeError("Model output does not contain logits")
 
     @staticmethod
