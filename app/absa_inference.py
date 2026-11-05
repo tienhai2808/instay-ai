@@ -14,7 +14,13 @@ import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import load_file
 from torch import nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer, RobertaModel
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    RobertaConfig,
+    RobertaModel,
+    XLMRobertaConfig,
+)
 from transformers.modeling_outputs import SequenceClassifierOutput
 
 from app.logger import get_logger
@@ -110,8 +116,10 @@ class _RobertaABSA(nn.Module):
         return SequenceClassifierOutput(logits=logits)
 
     @classmethod
-    def from_checkpoint(cls, snapshot_dir: Path) -> _RobertaABSA:
-        model = cls(AutoConfig.from_pretrained(snapshot_dir))
+    def from_checkpoint(
+        cls, snapshot_dir: Path, config: RobertaConfig | XLMRobertaConfig
+    ) -> _RobertaABSA:
+        model = cls(config)
         # The legacy checkpoint stores the trained classifier heads in the .bin file.
         checkpoint = snapshot_dir / "pytorch_model.bin"
         if checkpoint.is_file():
@@ -310,20 +318,18 @@ class ABSAInferenceEngine:
         last_error: Exception | None = None
         for model_repo, model_revision in model_repo_candidates:
             try:
-                model_source, display_name, is_roberta_absa = (
-                    self._prepare_model_source(
-                        model_repo=model_repo,
-                        model_revision=model_revision,
-                        code_repo_candidates=code_repo_candidates,
-                    )
+                model_source, display_name, local_config = self._prepare_model_source(
+                    model_repo=model_repo,
+                    model_revision=model_revision,
+                    code_repo_candidates=code_repo_candidates,
                 )
                 logger.info(
                     "Loading ABSA model from `%s` (revision=%s)",
                     display_name,
                     model_revision,
                 )
-                if is_roberta_absa:
-                    model = _RobertaABSA.from_checkpoint(model_source)
+                if local_config is not None:
+                    model = _RobertaABSA.from_checkpoint(model_source, local_config)
                 else:
                     model = AutoModel.from_pretrained(
                         model_source,
@@ -374,7 +380,7 @@ class ABSAInferenceEngine:
         model_repo: str,
         model_revision: str,
         code_repo_candidates: list[tuple[str, str]],
-    ) -> tuple[Path, str, bool]:
+    ) -> tuple[Path, str, RobertaConfig | XLMRobertaConfig | None]:
         snapshot_dir = Path(snapshot_download(model_repo, revision=model_revision))
         if not self._has_model_weights(snapshot_dir):
             raise RuntimeError(f"Model repo `{model_repo}` has no weight file")
@@ -382,16 +388,20 @@ class ABSAInferenceEngine:
         model_config = json.loads(
             (snapshot_dir / "config.json").read_text(encoding="utf-8")
         )
+        model_type = model_config.get("model_type")
         auto_map = model_config.get("auto_map") or {}
         if (
-            model_config.get("model_type") in ("roberta", "xlm-roberta")
+            model_type in ("roberta", "xlm-roberta")
             and auto_map.get("AutoModel") == "models.TransformerForABSA"
         ):
-            return snapshot_dir, model_repo, True
+            config_class = (
+                RobertaConfig if model_type == "roberta" else XLMRobertaConfig
+            )
+            return snapshot_dir, model_repo, config_class.from_dict(model_config)
 
         models_file = snapshot_dir / "models.py"
         if models_file.exists():
-            return snapshot_dir, model_repo, False
+            return snapshot_dir, model_repo, None
 
         for code_repo, code_repo_revision in code_repo_candidates:
             try:
@@ -407,7 +417,7 @@ class ABSAInferenceEngine:
                     f"{model_repo}@{model_revision} + models.py from "
                     f"{code_repo}@{code_repo_revision}"
                 )
-                return runtime_dir, display_name, False
+                return runtime_dir, display_name, None
             except Exception:
                 logger.warning(
                     "Cannot reuse models.py from `%s` (revision=%s)",
