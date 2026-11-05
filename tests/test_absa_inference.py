@@ -3,13 +3,63 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
+from transformers import RobertaConfig
 
-from app.absa_inference import ABSAInferenceEngine, DEFAULT_ASPECT_LABELS, ReviewPrediction
+from app.absa_inference import (
+    ABSAInferenceEngine,
+    DEFAULT_ASPECT_LABELS,
+    ReviewPrediction,
+    _RobertaABSA,
+)
 
 
 class ABSAInferenceTest(unittest.TestCase):
+    def test_legacy_checkpoint_loads_trained_heads_without_remote_model_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            snapshot = Path(temp_dir)
+            config = RobertaConfig(
+                vocab_size=16,
+                hidden_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=16,
+                num_aspects=1,
+                num_sentiments=2,
+                auto_map={"AutoModel": "models.TransformerForABSA"},
+            )
+            config.save_pretrained(snapshot)
+            trained_model = _RobertaABSA(config)
+            with torch.no_grad():
+                trained_model.sentiment_classifiers[0].weight.zero_()
+                trained_model.sentiment_classifiers[0].bias.copy_(torch.tensor([1.0, 2.0, 3.0]))
+            torch.save(trained_model.state_dict(), snapshot / "pytorch_model.bin")
+
+            with (
+                patch("app.absa_inference.snapshot_download", return_value=str(snapshot)),
+                patch("app.absa_inference.AutoTokenizer.from_pretrained"),
+                patch("app.absa_inference.hf_hub_download") as download_code,
+            ):
+                engine = ABSAInferenceEngine(
+                    repo_id="example/absa",
+                    fallback_repo_id="",
+                    repo_revision="main",
+                    fallback_repo_revision="main",
+                    tokenizer_fallback_revision="main",
+                    max_length=8,
+                    batch_size=1,
+                    confidence_threshold=0.5,
+                    device="cpu",
+                    torch_num_threads=0,
+                )
+
+            with torch.inference_mode():
+                output = engine._model(input_ids=torch.tensor([[0, 2]]))
+            torch.testing.assert_close(output.logits, torch.tensor([[[1.0, 2.0, 3.0]]]))
+            download_code.assert_not_called()
+
     def test_unique_preserve_order_and_weight_detection(self) -> None:
         self.assertEqual(
             ABSAInferenceEngine._unique_preserve_order(["a", "", "a", "b", "b"]),

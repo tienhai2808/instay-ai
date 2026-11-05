@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import tempfile
@@ -11,7 +12,10 @@ from typing import Any
 
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
-from transformers import AutoModel, AutoTokenizer
+from safetensors.torch import load_file
+from torch import nn
+from transformers import AutoConfig, AutoModel, AutoTokenizer, RobertaModel
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 from app.logger import get_logger
 
@@ -82,6 +86,40 @@ class PredictOutput:
     predictions: list[ReviewPrediction]
     elapsed_ms: float
     applied_confidence_threshold: float
+
+
+class _RobertaABSA(nn.Module):
+    def __init__(self, config: Any) -> None:
+        super().__init__()
+        self.config = config
+        self.roberta = RobertaModel(config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.sentiment_classifiers = nn.ModuleList(
+            nn.Linear(config.hidden_size, config.num_sentiments + 1)
+            for _ in range(config.num_aspects)
+        )
+
+    def forward(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None
+    ) -> SequenceClassifierOutput:
+        outputs = self.roberta(input_ids, attention_mask=attention_mask)
+        pooled = self.dropout(outputs.pooler_output)
+        logits = torch.stack(
+            [head(pooled) for head in self.sentiment_classifiers], dim=1
+        )
+        return SequenceClassifierOutput(logits=logits)
+
+    @classmethod
+    def from_checkpoint(cls, snapshot_dir: Path) -> _RobertaABSA:
+        model = cls(AutoConfig.from_pretrained(snapshot_dir))
+        # The legacy checkpoint stores the trained classifier heads in the .bin file.
+        checkpoint = snapshot_dir / "pytorch_model.bin"
+        if checkpoint.is_file():
+            state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        else:
+            state = load_file(snapshot_dir / "model.safetensors")
+        model.load_state_dict(state)
+        return model
 
 
 class ABSAInferenceEngine:
@@ -272,21 +310,26 @@ class ABSAInferenceEngine:
         last_error: Exception | None = None
         for model_repo, model_revision in model_repo_candidates:
             try:
-                model_source, display_name = self._prepare_model_source(
-                    model_repo=model_repo,
-                    model_revision=model_revision,
-                    code_repo_candidates=code_repo_candidates,
+                model_source, display_name, is_roberta_absa = (
+                    self._prepare_model_source(
+                        model_repo=model_repo,
+                        model_revision=model_revision,
+                        code_repo_candidates=code_repo_candidates,
+                    )
                 )
                 logger.info(
                     "Loading ABSA model from `%s` (revision=%s)",
                     display_name,
                     model_revision,
                 )
-                model = AutoModel.from_pretrained(
-                    model_source,
-                    revision=model_revision,
-                    trust_remote_code=True,
-                )
+                if is_roberta_absa:
+                    model = _RobertaABSA.from_checkpoint(model_source)
+                else:
+                    model = AutoModel.from_pretrained(
+                        model_source,
+                        revision=model_revision,
+                        trust_remote_code=True,
+                    )
                 return display_name, tokenizer, model
             except Exception as exc:
                 last_error = exc
@@ -331,14 +374,24 @@ class ABSAInferenceEngine:
         model_repo: str,
         model_revision: str,
         code_repo_candidates: list[tuple[str, str]],
-    ) -> tuple[str, str]:
+    ) -> tuple[Path, str, bool]:
         snapshot_dir = Path(snapshot_download(model_repo, revision=model_revision))
         if not self._has_model_weights(snapshot_dir):
             raise RuntimeError(f"Model repo `{model_repo}` has no weight file")
 
+        model_config = json.loads(
+            (snapshot_dir / "config.json").read_text(encoding="utf-8")
+        )
+        auto_map = model_config.get("auto_map") or {}
+        if (
+            model_config.get("model_type") in ("roberta", "xlm-roberta")
+            and auto_map.get("AutoModel") == "models.TransformerForABSA"
+        ):
+            return snapshot_dir, model_repo, True
+
         models_file = snapshot_dir / "models.py"
         if models_file.exists():
-            return str(snapshot_dir), model_repo
+            return snapshot_dir, model_repo, False
 
         for code_repo, code_repo_revision in code_repo_candidates:
             try:
@@ -354,7 +407,7 @@ class ABSAInferenceEngine:
                     f"{model_repo}@{model_revision} + models.py from "
                     f"{code_repo}@{code_repo_revision}"
                 )
-                return str(runtime_dir), display_name
+                return runtime_dir, display_name, False
             except Exception:
                 logger.warning(
                     "Cannot reuse models.py from `%s` (revision=%s)",

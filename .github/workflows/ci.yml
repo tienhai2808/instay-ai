@@ -145,11 +145,7 @@ jobs:
           grep -Ei '^torch([[:space:]]*([=@]{1,2})|$)' requirements-main-audit.txt || true
 
       - name: pip-audit
-        run: |
-          # Temporary exception:
-          # transformers 4.57.x is flagged by CVE-2026-1839 and the suggested fix is
-          # currently a pre-release (5.0.0rc3). Keep strict mode for everything else.
-          pip-audit -r requirements-main-audit.txt --strict --ignore-vuln CVE-2026-1839
+        run: pip-audit -r requirements-main-audit.txt --strict
 
   build-test:
     name: Build & Test
